@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
     Index,
     Integer,
@@ -49,10 +50,52 @@ class RecordVersion(Base):
         UUID(as_uuid=True), ForeignKey("records.id", ondelete="CASCADE"), primary_key=True
     )
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
-    original_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 版本原文：销毁后为 NULL（版本行与 intervals 继续留存）。销毁是终态：
+    # 该版本此后不能再直接发布、提交受控申请或被待审申请批准签发。
+    original_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     # JSONB 数组，元素为 {"start": int, "end": int}，左闭右开、按 Unicode 码点计
     intervals: Mapped[list] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class VersionOriginalDestruction(Base):
+    """历史版本原文销毁记录：机构按 (record_id, version) 销毁不应留存的原文。
+
+    - 首次销毁原子清除该版本原文（record_versions.original_text）及该版本
+      全部受控发布申请冻结的原文（publish_requests.frozen_text，无论申请处于
+      pending/approved/rejected），版本行、脱敏区间、申请状态与其余元数据保留；
+    - (record_id, version) 唯一：重复销毁幂等，原样回放首次销毁时间与原因，
+      绝不再次改写任何内容；
+    - 销毁提交后该版本的直接发布、受控申请提交与待审申请批准一律拒绝
+      （待审申请仍可驳回）；其他版本的修订与发布不受影响；
+    - 既有脱敏快照、读取凭证、额度、审计事件与公开读取约定均不变；
+    - 原因仅维护侧可见，公开读取响应绝不透露销毁状态。
+    """
+
+    __tablename__ = "version_original_destructions"
+    __table_args__ = (
+        UniqueConstraint(
+            "record_id", "version", name="uq_version_original_destructions_record_version"
+        ),
+        ForeignKeyConstraint(
+            ["record_id", "version"],
+            ["record_versions.record_id", "record_versions.version"],
+            name="fk_version_original_destructions_version",
+            ondelete="CASCADE",
+        ),
+        Index("ix_version_original_destructions_record", "record_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    record_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 销毁原因：非空白，仅维护侧可见；首次销毁固定，重复操作不覆盖
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    destroyed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
@@ -221,7 +264,10 @@ class PublishRequest(Base):
     )
     # 申请目标版本；待审内容冻结在 frozen_* 字段，后续修订不改变它
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    frozen_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 申请冻结的版本原文；所申请版本被销毁时原子置 NULL（申请状态与区间保留）。
+    # NULL 表示冻结原文已销毁：该待审申请此后只能驳回，不能再批准签发；
+    # 已终态申请的冻结原文同样被清除，仅保留状态与元数据。
+    frozen_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     frozen_intervals: Mapped[list] = mapped_column(JSONB, nullable=False)
 
     status: Mapped[str] = mapped_column(

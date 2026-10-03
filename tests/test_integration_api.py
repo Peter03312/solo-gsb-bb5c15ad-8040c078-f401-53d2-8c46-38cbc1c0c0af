@@ -4014,5 +4014,567 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["reads_used"], 3)
 
 
+class VersionOriginalDestructionIntegrationTests(unittest.TestCase):
+    """历史版本原文销毁：原子清除、幂等回放、销毁后发布/申请/批准拒绝、其余约定不变。"""
+
+    DESTROY_REASON = "保留期届满，按制度销毁该版本原文"
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具方法 ----
+
+    def _destroy(self, version=1, reason=DESTROY_REASON, expected=200, record_id=None):
+        rid = record_id or self.record_id
+        body = {"reason": reason} if reason is not None else {}
+        r = self.client.post(
+            f"/records/{rid}/versions/{version}/destroy-original",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _revise(self, text_="第二版全新原文，DEF。", base_version=1):
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={"text": text_, "intervals": [{"start": 0, "end": 3}], "base_version": base_version},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["version"]
+
+    def _mark_controlled(self):
+        r = self.client.put(f"/records/{self.record_id}/controlled", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _submit(self, version=1, auth=BASIC_ALICE, expected=201):
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=auth,
+            json={"version": version},
+        )
+        if expected is not None:
+            self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _db_state(self, version=1):
+        """直接查库核对：版本原文/区间与申请冻结原文/状态（响应里不应出现原文）。"""
+        import psycopg2
+        from urllib.parse import urlparse, parse_qs
+
+        url = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://")
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        conn = psycopg2.connect(
+            host=qs.get("host", [parsed.hostname or "localhost"])[0],
+            port=parsed.port or 5432,
+            user=parsed.username,
+            password=parsed.password,
+            dbname=parsed.path.lstrip("/"),
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT original_text, intervals FROM record_versions "
+                    "WHERE record_id = %s AND version = %s",
+                    (self.record_id, version),
+                )
+                original_text, intervals = cur.fetchone()
+                cur.execute(
+                    "SELECT status, frozen_text, reviewed_by FROM publish_requests "
+                    "WHERE record_id = %s AND version = %s ORDER BY created_at",
+                    (self.record_id, version),
+                )
+                requests = cur.fetchall()
+                cur.execute(
+                    "SELECT count(*) FROM version_original_destructions "
+                    "WHERE record_id = %s AND version = %s",
+                    (self.record_id, version),
+                )
+                destruction_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+        return {
+            "original_text": original_text,
+            "intervals": intervals,
+            "requests": requests,
+            "destruction_count": destruction_count,
+        }
+
+    # ---- 首次销毁：原子清除 + 响应形态 ----
+
+    def test_first_destroy_clears_version_original_and_returns_metadata(self):
+        r = self._destroy()
+        body = r.json()
+        self.assertEqual(body["record_id"], self.record_id)
+        self.assertEqual(body["version"], 1)
+        self.assertFalse(body["replayed"])
+        self.assertEqual(body["reason"], self.DESTROY_REASON)
+        self.assertIn("destroyed_at", body)
+        self.assertNotIn("original_text", body)
+        state = self._db_state()
+        self.assertIsNone(state["original_text"])
+        # 脱敏区间保留
+        self.assertEqual(
+            state["intervals"],
+            [{"start": s, "end": e} for s, e in [
+                (INTERVALS_V1[0]["start"], INTERVALS_V1[0]["end"]),
+                (INTERVALS_V1[1]["start"], INTERVALS_V1[1]["end"]),
+                (INTERVALS_V1[2]["start"], INTERVALS_V1[2]["end"]),
+            ]],
+        )
+        self.assertEqual(state["destruction_count"], 1)
+
+    def test_destroy_clears_frozen_text_of_all_request_states_but_keeps_status(self):
+        self._mark_controlled()
+        # 一个待审申请
+        pending = self._submit()
+        pending_id = pending.json()["request_id"]
+        # 第二个申请：carol 提交、bob 驳回（终态 rejected）
+        second = self._submit(auth=BASIC_CAROL)
+        second_id = second.json()["request_id"]
+        rejected = self.client.post(
+            f"/publish-requests/{second_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "不予通过"},
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        r = self._destroy()
+        self.assertFalse(r.json()["replayed"])
+        state = self._db_state()
+        statuses = {(row[0], row[1]) for row in state["requests"]}
+        # pending 与 rejected 状态保留；冻结原文全部清空
+        self.assertEqual({s for s, _ in statuses}, {"pending", "rejected"})
+        self.assertTrue(all(frozen is None for _, frozen in statuses))
+        # 待审申请仍可查、状态不变
+        info = self.client.get(f"/publish-requests/{pending_id}", auth=BASIC_CAROL)
+        self.assertEqual(info.status_code, 200, info.text)
+        self.assertEqual(info.json()["status"], "pending")
+
+    # ---- 幂等回放 ----
+
+    def test_repeated_destroy_replays_first_time_and_reason_without_rewrite(self):
+        first = self._destroy(reason="首次理由 A")
+        at1 = first.json()["destroyed_at"]
+        second = self._destroy(reason="另一个理由 B")
+        body2 = second.json()
+        self.assertTrue(body2["replayed"])
+        self.assertEqual(body2["destroyed_at"], at1)
+        self.assertEqual(body2["reason"], "首次理由 A")
+        # 空理由重复也回放，不校验
+        third = self._destroy(reason="  ")
+        self.assertTrue(third.json()["replayed"])
+        self.assertEqual(third.json()["destroyed_at"], at1)
+        self.assertEqual(self._db_state()["destruction_count"], 1)
+
+    # ---- 鉴权与参数校验 ----
+
+    def test_destroy_requires_service_key(self):
+        r = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy-original",
+            json={"reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_blank_reason_rejected_on_first_destroy(self):
+        for blank in ("", "   ", "\t\n"):
+            rid = self.client.post(
+                "/records",
+                headers=SERVICE_HEADERS,
+                json={"text": "记录X", "intervals": []},
+            ).json()["record_id"]
+            r = self._destroy(reason=blank, expected=422, record_id=rid)
+            self.assertIn("reason", r.json()["detail"])
+        # 请求体完全缺省 reason 同样 422
+        r = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy-original",
+            headers=SERVICE_HEADERS,
+            json={},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        # 被拒绝后原文仍在，补非空白理由可正常销毁
+        check = self._destroy(reason="正式理由")
+        self.assertEqual(check.status_code, 200, check.text)
+
+    def test_unknown_record_or_version_explicit_404(self):
+        import uuid
+
+        r = self._destroy(record_id=uuid.uuid4(), expected=404)
+        self.assertIn("record", r.json()["detail"])
+        r = self._destroy(version=99, expected=404)
+        self.assertIn("version", r.json()["detail"])
+        # 未知资源即使带了空理由也是 404（资源判定先于理由校验）
+        r = self.client.post(
+            f"/records/{uuid.uuid4()}/versions/1/destroy-original",
+            headers=SERVICE_HEADERS,
+            json={"reason": ""},
+        )
+        self.assertEqual(r.status_code, 404)
+
+    # ---- 销毁后发布/申请/批准拒绝 ----
+
+    def test_direct_publish_rejected_after_destroy(self):
+        self._destroy()
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("destroyed", r.json()["detail"])
+
+    def test_controlled_submit_rejected_after_destroy(self):
+        self._mark_controlled()
+        self._destroy()
+        self._submit(expected=409)
+
+    def test_pending_request_approval_rejected_but_rejection_still_allowed(self):
+        self._mark_controlled()
+        request_id = self._submit().json()["request_id"]
+        self._destroy()
+        approve = self.client.post(
+            f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approve.status_code, 409, approve.text)
+        self.assertIn("destroyed", approve.json()["detail"])
+        # 仍可驳回
+        reject = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "原文已销毁，驳回"},
+        )
+        self.assertEqual(reject.status_code, 200, reject.text)
+        self.assertEqual(reject.json()["status"], "rejected")
+        # 终态后再操作仍按既有 409
+        self.assertEqual(
+            self.client.post(
+                f"/publish-requests/{request_id}/reject", auth=BASIC_BOB
+            ).status_code,
+            409,
+        )
+
+    def test_other_versions_revise_and_publish_unaffected(self):
+        v2 = self._revise()
+        self._destroy(version=1)
+        # v1 发布拒绝
+        self.assertEqual(
+            self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1},
+            ).status_code,
+            409,
+        )
+        # v2 可发布
+        pub = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": v2},
+        )
+        self.assertEqual(pub.status_code, 201, pub.text)
+        # 可继续修订出 v3 并发布
+        v3 = self._revise(text_="第三版原文GHI。", base_version=v2)
+        pub3 = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": v3},
+        )
+        self.assertEqual(pub3.status_code, 201, pub3.text)
+
+    def test_destroy_current_version_does_not_block_revision_chain(self):
+        # 销毁当前版本原文不影响继续修订（修订提交新原文，不读取旧原文）
+        self._destroy(version=1)
+        v2 = self._revise()
+        self.assertEqual(v2, 2)
+
+    # ---- 既有快照/凭证/公开读取约定不变 ----
+
+    def test_existing_snapshot_credential_and_public_read_survive_destroy(self):
+        pub = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, "max_reads": 5},
+        )
+        sid, token = pub.json()["snapshot_id"], pub.json()["token"]
+        before = self.client.get(f"/public/snapshots/{sid}?token={token}")
+        self.assertEqual(before.status_code, 200, before.text)
+        self._destroy()
+        after = self.client.get(f"/public/snapshots/{sid}?token={token}")
+        self.assertEqual(after.status_code, 200, after.text)
+        self.assertEqual(after.json()["redacted_text"], before.json()["redacted_text"])
+        # 公开响应不透露销毁状态
+        self.assertNotIn("destroyed", after.text)
+        # 额度照常消耗
+        status = self.client.get(f"/tokens/{token}", headers=SERVICE_HEADERS)
+        self.assertEqual(status.json()["reads_used"], 2)
+        # 凭证仍可撤销、维护状态仍可查
+        self.assertEqual(
+            self.client.post(f"/tokens/{token}/revoke", headers=SERVICE_HEADERS).status_code,
+            200,
+        )
+
+    def test_destroy_does_not_affect_bundle_credential_or_audit_events(self):
+        pub = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        sid = pub.json()["snapshot_id"]
+        other = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "共享凭证另一快照。", "intervals": [{"start": 0, "end": 3}]},
+        ).json()["record_id"]
+        other_sid = self.client.post(
+            f"/records/{other}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        ).json()["snapshot_id"]
+        bundle = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [sid, other_sid], "max_reads": 5},
+        )
+        cred = self.client.post(
+            f"/bundle-requests/{bundle.json()['request_id']}/approve", auth=BASIC_BOB
+        ).json()["credential"]
+        self.client.get(f"/public/snapshots/{sid}?token={cred}")
+        self._destroy()
+        # 已发布快照仍可凭共享凭证读取（销毁的是原文，不是脱敏快照）
+        ok = self.client.get(f"/public/snapshots/{sid}?token={cred}")
+        self.assertEqual(ok.status_code, 200, ok.text)
+        events = self.client.get(
+            f"/snapshots/{sid}/read-events"
+            "?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z",
+            headers=SERVICE_HEADERS,
+        )
+        self.assertEqual(events.status_code, 200, events.text)
+        self.assertEqual(len(events.json()["events"]), 2)
+
+    def test_public_read_of_nonexistent_snapshot_still_vague_403(self):
+        import uuid
+
+        r = self.client.get(
+            f"/public/snapshots/{uuid.uuid4()}?token=whatever"
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+
+    # ---- 终态销毁后不可恢复签发 ----
+
+    def test_destroyed_version_cannot_emit_token_even_with_existing_snapshot(self):
+        pub = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(pub.status_code, 201)
+        self._destroy()
+        # 同版本再次签发令牌被拒绝（不能从快照之外再产生“基于原文”的签发，
+        # 且路径上原文已不存在）
+        again = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(again.status_code, 409)
+
+    def test_destroy_version_interval_retained_for_record_status(self):
+        self._destroy()
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["current_version"], 1)
+        state = self._db_state()
+        self.assertIsNotNone(state["intervals"])
+        self.assertIsNone(state["original_text"])
+
+    # ---- 并发：销毁与直接发布/申请提交/批准按提交顺序生效 ----
+
+    def test_concurrent_destroy_and_direct_publish_serializes_by_commit_order(self):
+        import uuid as uuid_mod
+
+        from sqlalchemy import select as sa_select
+
+        from app.db import SessionLocal
+        from app.models import RecordVersion as RecordVersionModel
+        from app.models import VersionOriginalDestruction as DestructionModel
+
+        rid = uuid_mod.UUID(self.record_id)
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def destroy():
+            db = SessionLocal()
+            try:
+                barrier.wait()
+                # 与 HTTP 销毁路径相同的锁序：只锁版本行（记录不删，普通读即可），
+                # 然后清除原文与登记；与直接发布在版本行上排队。
+                ver = db.execute(
+                    sa_select(RecordVersionModel)
+                    .where(
+                        RecordVersionModel.record_id == rid,
+                        RecordVersionModel.version == 1,
+                    )
+                    .with_for_update()
+                ).scalar_one()
+                ver.original_text = None
+                db.add(
+                    DestructionModel(
+                        record_id=rid,
+                        version=1,
+                        reason="并发销毁",
+                    )
+                )
+                db.commit()
+                results["destroy"] = "committed"
+            except Exception as exc:  # pragma: no cover - 仅在异常时暴露
+                db.rollback()
+                results["destroy"] = f"error: {exc}"
+            finally:
+                db.close()
+
+        def publish():
+            barrier.wait()
+            # 小延迟让销毁先拿锁：销毁先提交后，发布必 409
+            time.sleep(0.3)
+            r = self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1},
+            )
+            results["publish_status"] = r.status_code
+
+        t1 = threading.Thread(target=destroy)
+        t2 = threading.Thread(target=publish)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        self.assertEqual(results.get("destroy"), "committed", results)
+        self.assertEqual(results.get("publish_status"), 409, results)
+        self.assertIsNone(self._db_state()["original_text"])
+
+    def test_concurrent_destroy_and_approval_pending_request_stays_rejectable(self):
+        self._mark_controlled()
+        request_id = self._submit().json()["request_id"]
+        barrier = threading.Barrier(2)
+        outcome = {}
+
+        def approve():
+            try:
+                barrier.wait()
+                r = self.client.post(
+                    f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+                )
+                outcome["approve_status"] = r.status_code
+            except Exception as exc:  # pragma: no cover - 暴露跨线程异常
+                outcome["approve_error"] = repr(exc)
+
+        def destroy():
+            try:
+                barrier.wait()
+                r = self._destroy()
+                outcome["destroy_replayed"] = r.json()["replayed"]
+            except Exception as exc:  # pragma: no cover - 暴露跨线程异常
+                outcome["destroy_error"] = repr(exc)
+
+        t1 = threading.Thread(target=approve)
+        t2 = threading.Thread(target=destroy)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+        self.assertFalse(t1.is_alive(), outcome)
+        self.assertFalse(t2.is_alive(), outcome)
+        self.assertNotIn("approve_error", outcome, outcome)
+        self.assertNotIn("destroy_error", outcome, outcome)
+        # 两者必有一个先提交：批准 200（申请终态 approved，其冻结原文仍被清除）
+        # 或批准 409（申请保持 pending，仍可驳回）
+        self.assertIn(outcome.get("approve_status"), (200, 409), outcome)
+        state = self._db_state()
+        self.assertTrue(all(row[1] is None for row in state["requests"]))
+        if outcome["approve_status"] == 409:
+            reject = self.client.post(
+                f"/publish-requests/{request_id}/reject", auth=BASIC_BOB
+            )
+            self.assertEqual(reject.status_code, 200, reject.text)
+        else:
+            self.assertEqual(state["requests"][0][0], "approved")
+
+    def test_concurrent_destroy_and_controlled_submit_only_one_outcome_wins(self):
+        import uuid as uuid_mod
+
+        from sqlalchemy import select as sa_select
+
+        from app.db import SessionLocal
+        from app.models import RecordVersion as RecordVersionModel
+        from app.models import VersionOriginalDestruction as DestructionModel
+
+        self._mark_controlled()
+        rid = uuid_mod.UUID(self.record_id)
+        barrier = threading.Barrier(2)
+        outcome = {}
+
+        def destroy():
+            db = SessionLocal()
+            try:
+                barrier.wait()
+                # 与 HTTP 销毁路径相同：只锁版本行，与受控申请提交在版本行排队
+                ver = db.execute(
+                    sa_select(RecordVersionModel)
+                    .where(
+                        RecordVersionModel.record_id == rid,
+                        RecordVersionModel.version == 1,
+                    ).with_for_update()
+                ).scalar_one()
+                ver.original_text = None
+                db.add(DestructionModel(record_id=rid, version=1, reason="并发销毁"))
+                db.commit()
+                outcome["destroy"] = "committed"
+            except Exception as exc:  # pragma: no cover
+                db.rollback()
+                outcome["destroy"] = f"error: {exc}"
+            finally:
+                db.close()
+
+        def submit():
+            try:
+                barrier.wait()
+                r = self._submit(expected=None)
+                outcome["submit_status"] = r.status_code
+            except Exception as exc:  # pragma: no cover
+                outcome["submit"] = f"error: {exc}"
+
+        t1 = threading.Thread(target=destroy)
+        t2 = threading.Thread(target=submit)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+        self.assertFalse(t1.is_alive(), outcome)
+        self.assertFalse(t2.is_alive(), outcome)
+        # 提交先于销毁 -> 201（其冻结原文随后被清除）；销毁先于提交 -> 409
+        self.assertIn(outcome.get("submit_status"), (201, 409), outcome)
+        state = self._db_state()
+        self.assertIsNone(state["original_text"])
+        if state["requests"]:
+            self.assertTrue(all(row[1] is None for row in state["requests"]))
+
+
 if __name__ == "__main__":
     unittest.main()

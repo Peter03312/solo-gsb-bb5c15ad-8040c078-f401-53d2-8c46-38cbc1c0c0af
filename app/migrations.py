@@ -277,6 +277,63 @@ def _migrate_6_snapshot_windows(conn) -> None:
         )
 
 
+def _migrate_7_version_original_destruction(conn) -> None:
+    """v7：历史版本原文销毁——销毁登记表 + 两列原文改为可空。
+
+    空库路径下 v1 的 create_all 已按当前模型建出带新表与可空列的完整结构，
+    此处幂等；旧库路径先按当前模型补齐表，再用 IF NOT EXISTS 补建索引/约束，
+    并把历史库的两列 NOT NULL 约束幂等放开（DROP CONSTRAINT IF EXISTS，
+    约束名为 SQLAlchemy/PostgreSQL 对单列主键成员自动生成的标准名称）。
+
+    只放开约束：既有版本原文与全部申请冻结原文原样留存，不做任何数据改写；
+    之后仅经销毁接口按记录显式清除。新表的复合外键指向 record_versions 的
+    主键，保证销毁记录必然对应一个真实存在的历史版本。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_version_original_destructions_record_version
+            ON version_original_destructions (record_id, version)
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_version_original_destructions_record
+            ON version_original_destructions (record_id)
+            """
+        )
+    )
+    # 旧库补建复合外键（create_all 已建出时重复添加报 duplicate_object，DO 块跳过）
+    conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE version_original_destructions
+                ADD CONSTRAINT fk_version_original_destructions_version
+                FOREIGN KEY (record_id, version)
+                REFERENCES record_versions (record_id, version)
+                ON DELETE CASCADE;
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+            """
+        )
+    )
+    # 放开两列历史 NOT NULL：DROP NOT NULL 对已可空列是幂等 no-op，
+    # 空库按新模型本就可空。不触碰、不回填任何原文数据。
+    conn.execute(
+        text("ALTER TABLE record_versions ALTER COLUMN original_text DROP NOT NULL")
+    )
+    conn.execute(
+        text("ALTER TABLE publish_requests ALTER COLUMN frozen_text DROP NOT NULL")
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -285,6 +342,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (4, "record_freezes", _migrate_4_record_freezes),
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
     (6, "snapshot_windows", _migrate_6_snapshot_windows),
+    (7, "version_original_destruction", _migrate_7_version_original_destruction),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]
