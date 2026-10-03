@@ -118,6 +118,30 @@ class RecordUnfreezeResponse(BaseModel):
     already_unfrozen: bool = False
 
 
+# ---- 历史版本原文销毁（机构维护侧；销毁状态不向公开侧透露） ----
+
+
+class VersionDestroyRequest(BaseModel):
+    # 销毁理由：首次销毁必填（非空白）；重复销毁回放首次结果、忽略本次内容
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class VersionDestructionResponse(BaseModel):
+    """销毁结果：重复销毁回放首次销毁时间与理由。
+
+    repeated=false 为首次销毁（本次完成原文清除）；repeated=true 表示该版本
+    此前已销毁，destroyed_at/reason 均为首次值，本次未改写任何数据。
+    """
+
+    record_id: UUID
+    version: int
+    destroyed_at: datetime
+    # 首次销毁理由（仅维护侧可见；重复销毁时不被覆盖）
+    reason: str
+    # 是否为重复销毁：true 时原样回放首次结果，不再次清除/改写
+    repeated: bool = False
+
+
 class RecordResponse(BaseModel):
     record_id: UUID
     version: int

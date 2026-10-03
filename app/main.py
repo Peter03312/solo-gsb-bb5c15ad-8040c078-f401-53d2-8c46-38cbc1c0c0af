@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -45,6 +45,7 @@ from .models import (
     SENSITIVE_PHRASE_SETTINGS_ID,
     SensitivePhraseSettings,
     Snapshot,
+    VersionDestruction,
 )
 from .redaction import (
     IntervalOutOfBoundsError,
@@ -93,6 +94,8 @@ from .schemas import (
     SnapshotWithdrawRequest,
     SnapshotWithdrawResponse,
     TokenStatusResponse,
+    VersionDestroyRequest,
+    VersionDestructionResponse,
 )
 from .security import Operator, require_operator, require_role, require_service_key
 
@@ -174,8 +177,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.9.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 版本化数据库升级）",
+    version="1.10.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -259,23 +262,45 @@ def _verify_against_settings(
         )
 
 
-def _verify_phrases_cover_text(
-    db: Session, text: str, intervals: list[tuple[int, int]]
-) -> SensitivePhraseSettings:
-    """按当前启用清单核验原文：每个区分大小写的字面量命中都须被遮蔽区间完整覆盖。
+def _version_destroyed_conflict() -> HTTPException:
+    """版本原文已销毁：直接发布/申请提交/待审批准一律 409（不回显销毁理由）。"""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="original text of this record version has been destroyed",
+    )
 
-    先锁定清单单行（固定锁序的第一把锁）再在锁内核验，行锁持有至本次事务
-    提交/回滚，保证核验与提交对应同一已提交清单版本。核验失败统一 422 并回滚：
-    绝不回显任何短语或原文，且不产生快照、令牌或改变申请状态。返回锁定的
-    清单行，供需要在同一把锁后继续加其他行锁的调用方复用。
+
+def _lock_version_for_issuance(
+    db: Session, settings_row: SensitivePhraseSettings, record_id: UUID, version_no: int
+) -> RecordVersion:
+    """在已持有的清单行锁后锁定历史版本行并核对销毁状态。
+
+    固定锁序“清单行 -> 版本行”与版本销毁事务完全一致，使销毁与直接发布/
+    受控申请提交按行锁串行：销毁提交后才拿到版本行锁的发布/提交必定看到
+    销毁登记并 409，绝不使用已清除的原文（销毁后该列也为 NULL）。
+
+    未知记录 -> 404；版本不存在 -> 404；已销毁 -> 409。
     """
-    settings_row = _lock_sensitive_phrase_settings(db)
-    try:
-        _verify_against_settings(settings_row, text, intervals)
-    except HTTPException:
+    if db.get(Record, record_id) is None:
         db.rollback()
-        raise
-    return settings_row
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    version = db.execute(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id, RecordVersion.version == version_no)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if version is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    destroyed = db.get(VersionDestruction, (record_id, version_no))
+    if destroyed is not None or version.original_text is None:
+        # 销毁登记存在或原文已被清除：不再放行任何签发路径（后者为防御性核对）
+        db.rollback()
+        raise _version_destroyed_conflict()
+    return version
 
 
 def _future_expires_at(
@@ -619,11 +644,18 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
     )
     # 提交时截止已到则整次拒绝（成对性/开放早于截止已在 schema 422 校验）
     _validate_window_at_submission(window_close_at)
+    # 固定锁序“清单行 -> 版本行”：先锁清单行（同时完成短语核验），再锁版本行，
+    # 与版本销毁事务同序串行。销毁提交后才拿到版本行锁的发布必定看到销毁并 409，
+    # 绝不使用已清除的原文；发布先提交则随后销毁只影响之后的操作，本次发布已完成。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    version = _lock_version_for_issuance(db, settings_row, record_id, payload.version)
     version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
-    # 敏感短语核验：先锁清单单行并在锁内核验，行锁持有至本次发布提交，
-    # 保证核验与提交对应同一已提交清单版本（与清单替换并发时按事务先后串行）。
-    # 不通过则整次拒绝：不产生快照或令牌。
-    _verify_phrases_cover_text(db, version.original_text, version_intervals)
+    # 在已锁定的同一清单版本上核验：不通过整次拒绝，不产生快照或令牌。
+    try:
+        _verify_against_settings(settings_row, version.original_text, version_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
     redacted = redact_text(version.original_text, version_intervals)
     # 快照按 (record_id, version) 唯一：并发发布时唯一约束保证只落库一份，
     # 且快照与令牌在同一事务提交，不会出现部分发布。
@@ -735,11 +767,22 @@ def submit_publish_request(
         payload.window_open_at, payload.window_close_at
     )
     _validate_window_at_submission(window_close_at)
+    # 固定锁序“清单行 -> 版本行”：先锁清单行，再锁版本行并在锁内核验，
+    # 与版本销毁事务同序串行：销毁提交后才拿到版本行锁的提交必定看到销毁并 409，
+    # 绝不冻结已清除的原文；提交先提交则销毁随后清除本次冻结的原文、待审仍可驳回。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    version = _lock_version_for_issuance(db, settings_row, record_id, payload.version)
     frozen_intervals = [dict(iv) for iv in version.intervals]
     # 提交即须按当前启用清单核验拟发布版本原文：不通过整次拒绝，不产生待审申请。
-    _verify_phrases_cover_text(
-        db, version.original_text, [(iv["start"], iv["end"]) for iv in frozen_intervals]
-    )
+    try:
+        _verify_against_settings(
+            settings_row,
+            version.original_text,
+            [(iv["start"], iv["end"]) for iv in frozen_intervals],
+        )
+    except HTTPException:
+        db.rollback()
+        raise
     # 待审内容在此冻结：后续修订只产生新版本，不改变本申请绑定的原文与区间
     request = PublishRequestModel(
         record_id=record_id,
@@ -782,16 +825,15 @@ def approve_publish_request(
     申请人不得复核；已终态（批准/驳回）的申请一律 409；
     行锁串行化并发复核，保证同一申请只有一个终态。
 
+    申请冻结版本的原文已被销毁时批准一律 409（申请保持待审、仍可驳回）。
+
     申请冻结了外部阅览时段时：截止时刻已到则拒绝批准（409），申请保持待审、
     仍可驳回；时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；
     申请未带时段则沿用快照既有时段（首次设置或仍为无限制）。
     """
-    # SELECT ... FOR UPDATE：并发复核在此排队，后进入者会看到已终态并被拒绝
-    request = db.execute(
-        select(PublishRequestModel)
-        .where(PublishRequestModel.id == request_id)
-        .with_for_update()
-    ).scalar_one_or_none()
+    # 先做无锁预检（存在性/终态/自检），权威判定在获取固定锁序的行锁后重做，
+    # 保证并发复核与版本销毁都由行锁串行。
+    request = db.get(PublishRequestModel, request_id)
     if request is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="publish request not found"
@@ -810,7 +852,32 @@ def approve_publish_request(
             detail="the requester may not review their own publish request",
         )
 
-    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
+    # 固定锁序“清单行 -> 申请行 -> 版本行 -> 快照行”，与直接发布/申请提交/版本
+    # 销毁保持同序，杜绝死锁。先锁清单行（批准时按当时启用清单重新核验），再以
+    # FOR UPDATE 重新锁定申请：并发复核在此排队，后进入者看到终态即 409。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    request = db.execute(
+        select(PublishRequestModel)
+        .where(PublishRequestModel.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    if request.status != REQUEST_PENDING:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "publish request already decided",
+                "status": request.status,
+            },
+        )
+    # 申请绑定版本的原文已在销毁中被清除：批准一律拒绝（申请保持待审、仍可驳回）。
+    # 销毁事务持“清单行 -> 版本行 -> 该版本申请行”锁在此与批准串行：销毁先提交
+    # 则本事务拿到申请行后必定看到 frozen_text 为空；批准先提交则销毁随后清除时
+    # 申请已是终态、快照已签发（销毁不影响已发布脱敏快照）。
+    if request.frozen_text is None:
+        db.rollback()
+        raise _version_destroyed_conflict()
     # 相对到期时长在签发时刻换算为绝对时刻；显式到期时刻沿用申请时的选择。
     now = datetime.now(timezone.utc)
     if request.token_expires_in_seconds is not None:
@@ -828,9 +895,13 @@ def approve_publish_request(
         )
     frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
     # 批准时用“当时启用”的清单重新核验申请冻结的原文与区间（清单可能已在等待
-    # 期间变更）。先锁清单单行再锁快照行，锁序与直接发布一致、不会死锁；不通过
-    # 则整次拒绝：不产生快照或令牌，申请保持待审且仍可驳回。
-    _verify_phrases_cover_text(db, request.frozen_text, frozen_intervals)
+    # 期间变更）。清单行已在本事务开头锁定（固定锁序第一把），在锁内核验即可；
+    # 不通过则整次拒绝：不产生快照或令牌，申请保持待审且仍可驳回。
+    try:
+        _verify_against_settings(settings_row, request.frozen_text, frozen_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
     redacted = redact_text(request.frozen_text, frozen_intervals)
     db.execute(
         pg_insert(Snapshot)
@@ -1865,6 +1936,103 @@ def get_record_freeze(record_id: UUID, db: Session = Depends(get_db)):
         .order_by(RecordFreeze.frozen_at.desc())
     ).scalar_one_or_none()
     return _freeze_status_response(active, record_id)
+
+
+# ---- 历史版本原文销毁（维护侧；销毁状态不向公开侧透露） ----
+
+
+@app.post(
+    "/records/{record_id}/versions/{version}/destroy",
+    response_model=VersionDestructionResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def destroy_record_version(
+    record_id: UUID,
+    version: int = Path(..., ge=1),
+    payload: VersionDestroyRequest = Body(default_factory=VersionDestroyRequest),
+    db: Session = Depends(get_db),
+):
+    """销毁指定历史版本不应留存的原文。
+
+    - 凭服务密钥提交记录 ID、历史版本号与非空白理由：未知记录 404、未知版本
+      404、首次销毁空白理由 422、缺/错密钥 401；
+    - 首次销毁原子完成：清空该版本 record_versions.original_text 与该版本全部
+      受控发布申请冻结的 frozen_text（无论申请处于待审/批准/驳回），并登记
+      销毁时间与理由；版本行、申请状态（待审仍待审）与脱敏区间一律保留，
+      返回 record_id/version/destroyed_at/reason 与 repeated=false；
+    - 重复销毁（并发或重试）回放首次销毁时间与理由（repeated=true），不再次
+      清除或改写任何数据；并发首次销毁由固定锁序串行化，恰好一个首次结果；
+    - 销毁提交后：该版本的直接发布、受控申请提交与待审申请批准一律 409；
+      待审申请仍可驳回（不依赖原文）；其他版本的修订与发布不受影响；
+    - 既有脱敏快照、读取凭证、额度、读取审计与公开读取约定全部不变，公开响应
+      绝不透露销毁状态。
+    """
+    # 固定锁序与发布/提交/批准一致：“清单行 -> 版本行 -> 申请行”，
+    # 使销毁与所有签发路径按行锁串行，按事务提交顺序生效、不会死锁。
+    _lock_sensitive_phrase_settings(db)
+    if db.get(Record, record_id) is None:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    version_row = db.execute(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id, RecordVersion.version == version)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if version_row is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    # 锁定该版本全部受控申请行：销毁要在同一事务清空其冻结原文，同时与
+    # 正在进行的批准/驳回串行（批准路径先锁清单行再锁申请行，锁序一致）。
+    requests = (
+        db.execute(
+            select(PublishRequestModel)
+            .where(
+                PublishRequestModel.record_id == record_id,
+                PublishRequestModel.version == version,
+            )
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    existing = db.get(VersionDestruction, (record_id, version))
+    if existing is not None:
+        # 已销毁（含并发落选方）：回放首次时间与理由，绝不再次改写。
+        response = VersionDestructionResponse(
+            record_id=record_id,
+            version=version,
+            destroyed_at=existing.destroyed_at,
+            reason=existing.reason,
+            repeated=True,
+        )
+        db.rollback()  # 释放行锁，状态未被改变
+        return response
+    if not (payload.reason and payload.reason.strip()):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when destroying a record version",
+        )
+    # 原子清除：版本原文与该版本全部申请冻结的原文在同一事务置空。
+    # 申请状态、脱敏区间（record_versions.intervals 与 frozen_intervals）保留。
+    version_row.original_text = None
+    for request in requests:
+        request.frozen_text = None
+    destruction = VersionDestruction(
+        record_id=record_id, version=version, reason=payload.reason
+    )
+    db.add(destruction)
+    db.commit()
+    db.refresh(destruction)
+    return VersionDestructionResponse(
+        record_id=record_id,
+        version=version,
+        destroyed_at=destruction.destroyed_at,
+        reason=destruction.reason,
+        repeated=False,
+    )
 
 
 # ---- 敏感短语清单（机构维护侧：原子替换 + 查询；发布与申请提交/批准均核验） ----

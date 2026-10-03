@@ -4014,5 +4014,541 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["reads_used"], 3)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class VersionDestructionIntegrationTests(unittest.TestCase):
+    """历史版本原文销毁：原子清除、幂等回放、签发拒绝、驳回保留与并发边界。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具方法 ----
+
+    def _revise(self, base, text=TEXT_V2, intervals=None):
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={
+                "base_version": base,
+                "text": text,
+                "intervals": intervals if intervals is not None else [{"start": 0, "end": 2}],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["version"]
+
+    def _publish(self, version=1, extra=None, expected=201):
+        body = {"version": version}
+        if extra:
+            body.update(extra)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish", headers=SERVICE_HEADERS, json=body
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r.json() if expected == 201 else r
+
+    def _destroy(self, version=1, reason="保留期满，依规销毁原文", expected=200):
+        body = {} if reason is None else {"reason": reason}
+        r = self.client.post(
+            f"/records/{self.record_id}/versions/{version}/destroy",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _mark_controlled(self):
+        r = self.client.put(f"/records/{self.record_id}/controlled", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _submit(self, version=1, auth=BASIC_ALICE, expected=201):
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=auth,
+            json={"version": version},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _latest_request_id(self):
+        r = self.client.get(
+            f"/records/{self.record_id}/publish-requests", auth=BASIC_ALICE
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["requests"][-1]["request_id"]
+
+    # ---- 鉴权与明确拒绝 ----
+
+    def test_destroy_requires_service_key(self):
+        r = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy", json={"reason": "x"}
+        )
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy",
+            headers={"X-Service-Key": "wrong"},
+            json={"reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_unknown_record_and_version_are_rejected(self):
+        import uuid
+
+        unknown = str(uuid.uuid4())
+        r = self.client.post(
+            f"/records/{unknown}/versions/1/destroy",
+            headers=SERVICE_HEADERS,
+            json={"reason": "x"},
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"], "record not found")
+        r = self._destroy(version=999, reason="x", expected=404)
+        self.assertEqual(r.json()["detail"], "record version not found")
+
+    def test_blank_reason_rejected_on_first_destroy(self):
+        for body in ({}, {"reason": ""}, {"reason": "   "}):
+            r = self.client.post(
+                f"/records/{self.record_id}/versions/1/destroy",
+                headers=SERVICE_HEADERS,
+                json=body,
+            )
+            self.assertEqual(r.status_code, 422, (body, r.text))
+            self.assertIn("reason", r.json()["detail"])
+
+    # ---- 首次销毁：清除原文、保留版本/区间 ----
+
+    def test_first_destroy_clears_original_but_keeps_version_and_intervals(self):
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        r = self._destroy(reason="首次销毁原因").json()
+        self.assertFalse(r["repeated"])
+        self.assertEqual(r["record_id"], self.record_id)
+        self.assertEqual(r["version"], 1)
+        self.assertEqual(r["reason"], "首次销毁原因")
+        self.assertIsNotNone(r["destroyed_at"])
+        with SessionLocal() as session:
+            original, intervals = session.execute(
+                sql_text(
+                    "SELECT original_text, intervals FROM record_versions "
+                    "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                ),
+                {"rid": self.record_id},
+            ).one()
+        self.assertIsNone(original)
+        # 脱敏区间原样保留
+        self.assertEqual(intervals, [{"start": s, "end": e} for s, e in
+                                     [(2, 4), (10, 28), (34, 45)]])
+        # 销毁登记存在且仅一行
+        with SessionLocal() as session:
+            count = session.execute(
+                sql_text(
+                    "SELECT count(*) FROM version_destructions "
+                    "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                ),
+                {"rid": self.record_id},
+            ).scalar_one()
+        self.assertEqual(count, 1)
+
+    def test_destroy_clears_frozen_text_of_requests_in_all_states_but_keeps_status(self):
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        # 先发布 v1（留下已发布快照），标记受控，再对 v1 提交一个待审申请
+        self._publish(version=1)
+        self._mark_controlled()
+        self._submit(version=1)
+        pending_id = self._latest_request_id()
+        # 第二个申请并驳回 -> 终态申请的冻结原文也必须清除
+        self._submit(version=1)
+        rejected_id = self._latest_request_id()
+        rr = self.client.post(
+            f"/publish-requests/{rejected_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "驳回留痕"},
+        )
+        self.assertEqual(rr.status_code, 200, rr.text)
+
+        self._destroy(version=1)
+        with SessionLocal() as session:
+            rows = session.execute(
+                sql_text(
+                    "SELECT id::text, status, frozen_text, frozen_intervals "
+                    "FROM publish_requests "
+                    "WHERE record_id = CAST(:rid AS uuid) AND version = 1 "
+                    "ORDER BY created_at"
+                ),
+                {"rid": self.record_id},
+            ).all()
+        self.assertEqual(len(rows), 2)
+        statuses = {row[1] for row in rows}
+        self.assertEqual(statuses, {"pending", "rejected"})
+        for _id, _status, frozen_text, frozen_intervals in rows:
+            self.assertIsNone(frozen_text)
+            # 区间保留；申请状态保留（待审仍待审）
+            self.assertEqual(len(frozen_intervals), 3)
+        # 待审申请仍可查询，状态与区间元数据不变（不返回冻结原文）
+        info = self.client.get(
+            f"/publish-requests/{pending_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+        self.assertEqual(info["version"], 1)
+
+    # ---- 重复销毁：回放首次结果 ----
+
+    def test_repeated_destroy_replays_first_time_and_reason(self):
+        first = self._destroy(reason="首次原因").json()
+        # 不同理由/空理由重复：回放首次结果
+        second = self._destroy(reason="试图覆盖的原因").json()
+        self.assertTrue(second["repeated"])
+        self.assertEqual(second["destroyed_at"], first["destroyed_at"])
+        self.assertEqual(second["reason"], "首次原因")
+        third = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy",
+            headers=SERVICE_HEADERS,
+            json={},
+        )
+        self.assertEqual(third.status_code, 200, third.text)
+        body = third.json()
+        self.assertTrue(body["repeated"])
+        self.assertEqual(body["destroyed_at"], first["destroyed_at"])
+        self.assertEqual(body["reason"], "首次原因")
+
+    # ---- 销毁后签发路径全部拒绝；驳回仍允许 ----
+
+    def test_direct_publish_rejected_after_destroy(self):
+        self._destroy()
+        r = self._publish(expected=409)
+        self.assertNotIn(TEXT_V1, r.text)
+
+    def test_controlled_submit_and_approve_rejected_after_destroy_but_reject_allowed(self):
+        self._mark_controlled()
+        # 销毁前先留一个待审申请
+        self._submit(version=1)
+        pending_before = self._latest_request_id()
+        # 销毁
+        self._destroy()
+        # 新的受控申请提交 -> 409
+        self._submit(version=1, expected=409)
+        # 待审申请批准 -> 409（响应不含原文）
+        ar = self.client.post(
+            f"/publish-requests/{pending_before}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(ar.status_code, 409, ar.text)
+        self.assertNotIn(TEXT_V1, ar.text)
+        # 仍是待审，可驳回
+        info = self.client.get(
+            f"/publish-requests/{pending_before}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+        rr = self.client.post(
+            f"/publish-requests/{pending_before}/reject", auth=BASIC_BOB
+        )
+        self.assertEqual(rr.status_code, 200, rr.text)
+        self.assertEqual(rr.json()["status"], "rejected")
+
+    def test_destroy_after_approval_blocks_reapproval_via_snapshot_conflict_too(self):
+        # 先批准产生快照，再销毁：再次发布仍按既有规则拒绝（已销毁 -> 409）
+        self._mark_controlled()
+        self._submit(version=1)
+        rid = self._latest_request_id()
+        ar = self.client.post(f"/publish-requests/{rid}/approve", auth=BASIC_BOB)
+        self.assertEqual(ar.status_code, 200, ar.text)
+        self._destroy()
+        self._submit(version=1, expected=409)
+
+    # ---- 其他版本与既有产物不受影响；公开侧不透露销毁 ----
+
+    def test_other_versions_revise_and_publish_unaffected(self):
+        v2 = self._revise(base=1)
+        # 销毁 v1 后，v2 仍可发布；还能继续修订出 v3
+        self._destroy(version=1)
+        pub2 = self._publish(version=v2, extra={"max_reads": 3})
+        sid, tok = pub2["snapshot_id"], pub2["token"]
+        read = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertIn("redacted_text", read.json())
+        v3 = self._revise(base=2, text="版本三新原文XYZ", intervals=[{"start": 4, "end": 7}])
+        self.assertEqual(v3, 3)
+        # 公开响应中没有任何销毁字段
+        self.assertNotIn("destroyed", read.text)
+
+    def test_existing_snapshot_token_quota_audit_and_public_read_unchanged(self):
+        pub = self._publish(version=1, extra={"max_reads": 3})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        self._destroy()
+        # 既有脱敏快照继续公开可读、继续计数
+        r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn(TEXT_V1, r.text)
+        status = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(status["reads_used"], 2)
+        # 审计事件照常可查
+        events = self.client.get(
+            f"/snapshots/{sid}/read-events"
+            "?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z",
+            headers=SERVICE_HEADERS,
+        )
+        self.assertEqual(events.status_code, 200, events.text)
+        self.assertEqual(len(events.json()["events"]), 2)
+
+    # ---- 并发：销毁与签发按提交顺序生效 ----
+
+    def test_concurrent_destroy_calls_have_single_first_result(self):
+        results = []
+        barrier = threading.Barrier(8)
+
+        def destroy_once(i):
+            barrier.wait()
+            r = self.client.post(
+                f"/records/{self.record_id}/versions/1/destroy",
+                headers=SERVICE_HEADERS,
+                json={"reason": f"并发原因{i}"},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            results.append(r.json())
+
+        threads = [threading.Thread(target=destroy_once, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(results), 8)
+        first = [b for b in results if not b["repeated"]]
+        repeats = [b for b in results if b["repeated"]]
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(repeats), 7)
+        # 全部回放同一首次时间与理由
+        for b in results:
+            self.assertEqual(b["destroyed_at"], first[0]["destroyed_at"])
+            self.assertEqual(b["reason"], first[0]["reason"])
+
+    def test_publish_committed_first_then_destroy_keeps_snapshot_readable(self):
+        pub = self._publish(version=1, extra={"max_reads": 5})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self._destroy()
+        # 已发布脱敏快照与令牌继续工作
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        # 销毁后没有可用于重新签发的原文：再次发布 409
+        self._publish(expected=409)
+        # 库内不存在第二份原文副本（快照只存脱敏正文）
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            original = session.execute(
+                sql_text(
+                    "SELECT original_text FROM record_versions "
+                    "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                ),
+                {"rid": self.record_id},
+            ).scalar_one()
+        self.assertIsNone(original)
+
+    def test_concurrent_submit_then_destroy_leaves_request_rejectable(self):
+        # 受控申请提交成功（先提交）后销毁：冻结原文被清除、申请待审、可驳回不可批准
+        self._mark_controlled()
+        self._submit(version=1)
+        rid = self._latest_request_id()
+        self._destroy()
+        self.assertEqual(
+            self.client.post(
+                f"/publish-requests/{rid}/approve", auth=BASIC_BOB
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/publish-requests/{rid}/reject", auth=BASIC_BOB
+            ).status_code,
+            200,
+        )
+
+    def test_destroy_commits_first_publish_waiting_on_lock_is_rejected(self):
+        """销毁先持锁提交：在同一版本行锁队列中等待的发布随后看到销毁并 409。"""
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        ready = threading.Event()
+        release = threading.Event()
+
+        def destroy_under_gate():
+            session = SessionLocal()
+            try:
+                # 按接口相同的固定锁序持锁：清单行 -> 版本行
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                session.execute(
+                    sql_text(
+                        "SELECT version FROM record_versions "
+                        "WHERE record_id = CAST(:rid AS uuid) AND version = 1 FOR UPDATE"
+                    ),
+                    {"rid": self.record_id},
+                )
+                ready.set()
+                release.wait(timeout=10)
+                session.execute(
+                    sql_text(
+                        "UPDATE record_versions SET original_text = NULL "
+                        "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.execute(
+                    sql_text(
+                        "INSERT INTO version_destructions (record_id, version, reason) "
+                        "VALUES (CAST(:rid AS uuid), 1, '持锁串行测试')"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.commit()
+            finally:
+                session.close()
+
+        t = threading.Thread(target=destroy_under_gate)
+        t.start()
+        self.assertTrue(ready.wait(timeout=10))
+        result = {}
+        started = threading.Event()
+
+        def publish():
+            started.set()
+            r = self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1},
+            )
+            result["status"] = r.status_code
+
+        tp = threading.Thread(target=publish)
+        tp.start()
+        started.wait(timeout=5)
+        time.sleep(0.7)
+        # 发布在锁队列中等待，尚未完成
+        self.assertNotIn("status", result)
+        release.set()
+        t.join(timeout=10)
+        tp.join(timeout=15)
+        # 销毁先提交：等待中的发布必定看到销毁登记 -> 409，且无快照/令牌残留
+        self.assertEqual(result["status"], 409, result)
+        status = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status["snapshots"], [])
+
+    def test_approve_waiting_then_destroy_commits_approve_is_rejected(self):
+        """待审批准在锁上等待时销毁先提交：批准随后 409，申请仍待审、可驳回。"""
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        self._mark_controlled()
+        self._submit(version=1)
+        rid = self._latest_request_id()
+
+        ready = threading.Event()
+        release = threading.Event()
+
+        def destroy_under_gate():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                session.execute(
+                    sql_text(
+                        "SELECT version FROM record_versions "
+                        "WHERE record_id = CAST(:rid AS uuid) AND version = 1 FOR UPDATE"
+                    ),
+                    {"rid": self.record_id},
+                )
+                ready.set()
+                release.wait(timeout=10)
+                session.execute(
+                    sql_text(
+                        "UPDATE record_versions SET original_text = NULL "
+                        "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.execute(
+                    sql_text(
+                        "UPDATE publish_requests SET frozen_text = NULL "
+                        "WHERE record_id = CAST(:rid AS uuid) AND version = 1"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.execute(
+                    sql_text(
+                        "INSERT INTO version_destructions (record_id, version, reason) "
+                        "VALUES (CAST(:rid AS uuid), 1, '与批准并发')"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.commit()
+            finally:
+                session.close()
+
+        t = threading.Thread(target=destroy_under_gate)
+        t.start()
+        self.assertTrue(ready.wait(timeout=10))
+        result = {}
+
+        def approve():
+            client = TestClient(app_main.app)
+            r = client.post(f"/publish-requests/{rid}/approve", auth=BASIC_BOB)
+            result["status"] = r.status_code
+
+        ta = threading.Thread(target=approve)
+        ta.start()
+        time.sleep(0.7)
+        self.assertNotIn("status", result)
+        release.set()
+        t.join(timeout=10)
+        ta.join(timeout=15)
+        self.assertEqual(result["status"], 409, result)
+        info = self.client.get(f"/publish-requests/{rid}", auth=BASIC_ALICE).json()
+        self.assertEqual(info["status"], "pending")
+        # 仍可驳回
+        self.assertEqual(
+            self.client.post(
+                f"/publish-requests/{rid}/reject", auth=BASIC_BOB
+            ).status_code,
+            200,
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

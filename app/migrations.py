@@ -277,6 +277,24 @@ def _migrate_6_snapshot_windows(conn) -> None:
         )
 
 
+def _migrate_7_version_destructions(conn) -> None:
+    """v7：历史版本原文销毁（version_destructions 表 + 两个原文列放宽为可空）。
+
+    空库路径下 v1 的 create_all 已按当前模型建出完整表与可空列，此处幂等；
+    旧库路径先按当前模型补齐可能缺失的整张表，再把两个原文列放宽为 NULL
+    （仅 DROP NOT NULL，不触碰任何数据：没有任何已销毁版本时全部行仍非空）。
+    销毁登记行的复合外键随 create_all 建出；历史数据不受影响，
+    既有版本的原文一律原样留存，销毁只能由新接口在之后显式触发。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text("ALTER TABLE record_versions ALTER COLUMN original_text DROP NOT NULL")
+    )
+    conn.execute(
+        text("ALTER TABLE publish_requests ALTER COLUMN frozen_text DROP NOT NULL")
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -285,6 +303,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (4, "record_freezes", _migrate_4_record_freezes),
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
     (6, "snapshot_windows", _migrate_6_snapshot_windows),
+    (7, "version_destructions", _migrate_7_version_destructions),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

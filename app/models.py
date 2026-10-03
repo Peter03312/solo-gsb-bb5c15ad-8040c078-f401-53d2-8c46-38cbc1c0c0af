@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
     Index,
     Integer,
@@ -41,7 +42,11 @@ class Record(Base):
 
 
 class RecordVersion(Base):
-    """某次修订提交的原文与敏感区间，按 (record_id, version) 唯一。"""
+    """某次修订提交的原文与敏感区间，按 (record_id, version) 唯一。
+
+    版本被销毁后 original_text 置空（NULL）：版本行与 intervals 原样留存，
+    但该版本不再能发布/提交受控申请/批准待审申请（见 VersionDestruction）。
+    """
 
     __tablename__ = "record_versions"
 
@@ -49,11 +54,48 @@ class RecordVersion(Base):
         UUID(as_uuid=True), ForeignKey("records.id", ondelete="CASCADE"), primary_key=True
     )
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
-    original_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 销毁后为 NULL（行仍在，版本号与区间留存）；销毁前为修订提交时的原文
+    original_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     # JSONB 数组，元素为 {"start": int, "end": int}，左闭右开、按 Unicode 码点计
     intervals: Mapped[list] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class VersionDestruction(Base):
+    """历史版本原文销毁记录（按记录 ID + 版本号，每个版本至多一行）。
+
+    - 维护人员凭服务密钥销毁不应留存的版本原文：首次操作在同一事务原子清除
+      record_versions.original_text 与该版本全部受控发布申请冻结的 frozen_text，
+      并写入本行；版本行、申请状态（含待审）与脱敏区间一律保留。
+    - 首次销毁后不可改写：重复销毁回放首次销毁时间与理由（repeated=true），
+      绝不再次改写任何数据；理由仅维护侧可见。
+    - 销毁提交后，该版本的直接发布、受控申请提交与待审申请批准一律 409；
+      待审申请仍可驳回（不依赖原文）；其他版本的修订与发布不受影响。
+    - 与发布/提交/批准的并发由统一锁序（敏感短语清单行 -> 版本行 -> 申请行）
+      串行化，按事务提交顺序生效。
+    """
+
+    __tablename__ = "version_destructions"
+
+    # 仅由下方复合外键关联 record_versions 的 (record_id, version) 主键
+    record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 销毁原因：非空白，仅维护侧可见；首次销毁后永不被覆盖
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    destroyed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        # 复合外键：只有真实存在的（记录, 版本）才能登记销毁；记录删除时级联
+        ForeignKeyConstraint(
+            ["record_id", "version"],
+            ["record_versions.record_id", "record_versions.version"],
+            ondelete="CASCADE",
+            name="fk_version_destructions_record_version",
+        ),
     )
 
 
@@ -221,7 +263,8 @@ class PublishRequest(Base):
     )
     # 申请目标版本；待审内容冻结在 frozen_* 字段，后续修订不改变它
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    frozen_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 版本被销毁后置空（NULL）：申请状态与区间保留，但批准一律 409（待审仍可驳回）
+    frozen_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     frozen_intervals: Mapped[list] = mapped_column(JSONB, nullable=False)
 
     status: Mapped[str] = mapped_column(
